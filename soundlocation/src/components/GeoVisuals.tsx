@@ -4,10 +4,11 @@ import { geoState } from '../geo/geoState'
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
-const GRID_SIZE = 30          // 30×30 = 900 elevation samples
-const GRID_SPAN = 0.10        // ±0.10° around centre (≈ ±11 km at mid-latitudes)
-const V_SCALE   = 1.2         // scene units — peaks sit 1.2 units above valleys
-const REFETCH_M = 2000
+const GRID_SIZE  = 30          // 30×30 = 900 elevation samples
+const GRID_SPAN  = 0.10        // ±0.10° around centre (≈ ±11 km at mid-latitudes)
+const V_SCALE    = 1.2         // scene units — peaks sit 1.2 units above valleys
+const REFETCH_M  = 5000        // only re-fetch after moving 5 km
+const COOLDOWN_S = 90          // minimum seconds between any two fetch attempts
 
 function haversineM(lat1: number, lng1: number, lat2: number, lng2: number): number {
   const R = 6_371_000
@@ -233,15 +234,24 @@ export default function GeoVisuals() {
       wireframe: true,
     })
 
-    scene.add(new THREE.Mesh(geometry, material))
+    const mesh = new THREE.Mesh(geometry, material)
+    scene.add(mesh)
 
     // ── Elevation grid fetch ──────────────────────────────────────────────
+    const TOTAL    = GRID_SIZE * GRID_SIZE
+    const targetZ  = new Float32Array(TOTAL)   // desired heights; lerped toward in tick
+    const LERP_SPD = 0.028                     // per-frame factor — ~1.5 s to settle
+    const positions = geometry.attributes.position as THREE.BufferAttribute
+
     let gridCenterLat: number | null = null
     let gridCenterLng: number | null = null
     let fetchInFlight = false
+    let lastFetchEnd   = 0
 
     async function fetchAndApplyGrid(lat: number, lng: number) {
+      const now = Date.now()
       if (fetchInFlight || !alive) return
+      if (now - lastFetchEnd < COOLDOWN_S * 1000) return
       fetchInFlight = true
       setFetching(true)
       gridCenterLat = lat
@@ -259,31 +269,59 @@ export default function GeoVisuals() {
       }
 
       try {
-        const url =
-          `/api/elevation` +
-          `?latitude=${lats.join(',')}&longitude=${lngs.join(',')}`
-        const res = await fetch(url)
-        if (!res.ok || !alive) { fetchInFlight = false; return }
+        // One chunk every 13 s → full 30×30 grid builds over ~2 minutes.
+        // Each chunk is applied immediately so the terrain grows in real-time.
+        const CHUNK      = 100
+        const CHUNK_DELAY = 13_000 // ms
+        const total       = lats.length
+        const allElevs    = new Array<number>(total).fill(0)
+        const loaded      = new Array<boolean>(total).fill(false)
+        let   gMin        = Infinity
+        let   gMax        = -Infinity
 
-        const data = (await res.json()) as { elevation: number[] }
-        const elevs = data.elevation
-
-        let min = Infinity, max = -Infinity
-        for (const e of elevs) { min = Math.min(min, e); max = Math.max(max, e) }
-        const range = Math.max(max - min, 1)
-
-        const positions = geometry.attributes.position as THREE.BufferAttribute
-        for (let i = 0; i < elevs.length; i++) {
-          positions.setZ(i, ((elevs[i] - min) / range) * V_SCALE)
+        function applyLoaded() {
+          // Write into targetZ — the tick loop will lerp positions toward these
+          const range = Math.max(gMax - gMin, 1)
+          for (let k = 0; k < total; k++) {
+            if (loaded[k]) {
+              targetZ[k] = ((allElevs[k] - gMin) / range) * V_SCALE
+            }
+          }
         }
-        positions.needsUpdate = true
-        geometry.computeVertexNormals()
+
+        for (let i = 0; i < total; i += CHUNK) {
+          if (!alive) { fetchInFlight = false; return }
+
+          const bLats = lats.slice(i, i + CHUNK).join(',')
+          const bLngs = lngs.slice(i, i + CHUNK).join(',')
+          try {
+            const r = await fetch(`/api/elevation?latitude=${bLats}&longitude=${bLngs}`)
+            if (r.ok) {
+              const d = (await r.json()) as { elevation: number[] }
+              d.elevation.forEach((e, j) => {
+                allElevs[i + j] = e
+                loaded[i + j]   = true
+                if (e < gMin) gMin = e
+                if (e > gMax) gMax = e
+              })
+              applyLoaded()  // update mesh immediately with what we have so far
+            }
+          } catch { /* skip chunk */ }
+
+          if (i + CHUNK < total) {
+            await new Promise<void>(resolve => setTimeout(resolve, CHUNK_DELAY))
+          }
+        }
       } catch { /* keep current geometry on network failure */ }
       fetchInFlight = false
+      lastFetchEnd  = Date.now()
       setFetching(false)
     }
 
-    fetchRef.current = (lat, lng) => void fetchAndApplyGrid(lat, lng)
+    fetchRef.current = (lat, lng) => {
+      lastFetchEnd = 0 // bypass cooldown for manual debug fetches
+      void fetchAndApplyGrid(lat, lng)
+    }
 
     // ── Geo state subscription ────────────────────────────────────────────
     const unsub = geoState.subscribe((state) => {
@@ -316,9 +354,34 @@ export default function GeoVisuals() {
     // ── Animation loop ────────────────────────────────────────────────────
     let rafId: number
     const clock = new THREE.Clock()
+    const ROTATION_PERIOD = 120  // seconds per full Z revolution
+    const SNAP_THRESHOLD  = 5e-4 // stop lerping below this distance
+
     const tick = () => {
       rafId = requestAnimationFrame(tick)
-      uniforms.u_time.value = clock.getElapsedTime()
+      const t = clock.getElapsedTime()
+      uniforms.u_time.value = t
+      mesh.rotation.z = (t / ROTATION_PERIOD) * Math.PI * 2
+
+      // Lerp each vertex toward its target height
+      let dirty = false
+      for (let i = 0; i < TOTAL; i++) {
+        const cur = positions.getZ(i)
+        const tgt = targetZ[i]
+        const diff = tgt - cur
+        if (Math.abs(diff) > SNAP_THRESHOLD) {
+          positions.setZ(i, cur + diff * LERP_SPD)
+          dirty = true
+        } else if (cur !== tgt) {
+          positions.setZ(i, tgt)
+          dirty = true
+        }
+      }
+      if (dirty) {
+        positions.needsUpdate = true
+        geometry.computeVertexNormals()
+      }
+
       renderer.render(scene, camera)
     }
     tick()
@@ -335,16 +398,15 @@ export default function GeoVisuals() {
     }
   }, [])
 
-  const inputStyle: React.CSSProperties = {
-    background: 'rgba(255,255,255,0.06)',
-    border: '1px solid rgba(255,255,255,0.15)',
-    borderRadius: 4,
-    color: '#f1f5f9',
+  const bare: React.CSSProperties = {
     fontFamily: 'monospace',
-    fontSize: 12,
-    padding: '4px 8px',
-    width: '100%',
+    fontSize: 11,
+    color: 'rgba(255,255,255,0.5)',
+    background: 'none',
+    border: 'none',
     outline: 'none',
+    padding: 0,
+    width: 120,
   }
 
   return (
@@ -352,67 +414,33 @@ export default function GeoVisuals() {
       <div ref={mountRef} style={{ position: 'fixed', inset: 0, zIndex: 0 }} />
 
       <div style={{
-        position: 'fixed', bottom: 80, right: 16, zIndex: 100,
-        background: 'rgba(0,0,0,0.75)',
-        backdropFilter: 'blur(6px)',
-        border: '1px solid rgba(255,255,255,0.1)',
-        borderRadius: 8,
-        padding: '12px 14px',
-        color: '#e2e8f0',
-        fontFamily: 'monospace',
-        fontSize: 11,
-        display: 'flex',
-        flexDirection: 'column',
-        gap: 8,
-        minWidth: 210,
+        position: 'fixed', bottom: 16, right: 16, zIndex: 100,
+        fontFamily: 'monospace', fontSize: 11,
+        color: 'rgba(255,255,255,0.45)',
+        display: 'flex', flexDirection: 'column', gap: 4,
+        alignItems: 'flex-end',
       }}>
-        <div style={{ color: '#7dd3fc', fontWeight: 'bold', letterSpacing: '0.1em' }}>
-          LOCATION
-        </div>
-
-        <label style={{ display: 'flex', flexDirection: 'column', gap: 3 }}>
-          <span style={{ color: '#94a3b8' }}>latitude</span>
+        <div style={{ display: 'flex', gap: 6 }}>
           <input
-            type="number"
-            step="0.001"
-            value={debugLat}
+            type="number" step="0.001" value={debugLat}
             onChange={e => setDebugLat(e.target.value)}
             onKeyDown={e => e.key === 'Enter' && handleDebugFetch()}
-            placeholder="e.g. 45.50884"
-            style={inputStyle}
+            placeholder="lat"
+            style={bare}
           />
-        </label>
-
-        <label style={{ display: 'flex', flexDirection: 'column', gap: 3 }}>
-          <span style={{ color: '#94a3b8' }}>longitude</span>
           <input
-            type="number"
-            step="0.001"
-            value={debugLng}
+            type="number" step="0.001" value={debugLng}
             onChange={e => setDebugLng(e.target.value)}
             onKeyDown={e => e.key === 'Enter' && handleDebugFetch()}
-            placeholder="e.g. -73.58781"
-            style={inputStyle}
+            placeholder="lng"
+            style={bare}
           />
-        </label>
-
+        </div>
         <button
-          onClick={handleDebugFetch}
-          disabled={fetching}
-          style={{
-            marginTop: 2,
-            background: fetching ? 'rgba(125,211,252,0.1)' : 'rgba(125,211,252,0.18)',
-            border: '1px solid rgba(125,211,252,0.3)',
-            borderRadius: 4,
-            color: fetching ? '#64748b' : '#7dd3fc',
-            fontFamily: 'monospace',
-            fontSize: 11,
-            padding: '5px 0',
-            cursor: fetching ? 'default' : 'pointer',
-            letterSpacing: '0.08em',
-          }}
+          onClick={handleDebugFetch} disabled={fetching}
+          style={{ ...bare, width: 'auto', cursor: fetching ? 'default' : 'pointer', opacity: fetching ? 0.3 : 1 }}
         >
-          {fetching ? 'fetching…' : 'fetch terrain ↵'}
+          {fetching ? 'fetching…' : 'fetch ↵'}
         </button>
       </div>
     </>

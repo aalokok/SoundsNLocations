@@ -11,6 +11,13 @@ export default defineConfig({
     basicSsl(),
   ],
   server: {
-    host: true, // expose on all interfaces so phones on the same network can connect
+    host: true,
+    proxy: {
+      '/api/elevation': {
+        target: 'https://api.open-meteo.com/v1',
+        changeOrigin: true,
+        rewrite: (path) => path.replace(/^\/api\/elevation/, '/elevation'),
+      },
+    },
   },
 })

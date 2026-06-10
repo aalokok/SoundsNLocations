@@ -1,4 +1,4 @@
-import { useEffect, useRef } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import * as THREE from 'three'
 import { geoState } from '../geo/geoState'
 
@@ -179,7 +179,19 @@ const fragmentShader = /* glsl */ `
 // ── Component ─────────────────────────────────────────────────────────────────
 
 export default function GeoVisuals() {
-  const mountRef = useRef<HTMLDivElement>(null)
+  const mountRef   = useRef<HTMLDivElement>(null)
+  const fetchRef   = useRef<((lat: number, lng: number) => void) | null>(null)
+
+  const [debugLat, setDebugLat] = useState('')
+  const [debugLng, setDebugLng] = useState('')
+  const [fetching, setFetching] = useState(false)
+
+  function handleDebugFetch() {
+    const lat = parseFloat(debugLat)
+    const lng = parseFloat(debugLng)
+    if (isNaN(lat) || isNaN(lng)) return
+    fetchRef.current?.(lat, lng)
+  }
 
   useEffect(() => {
     const mount = mountRef.current
@@ -231,6 +243,7 @@ export default function GeoVisuals() {
     async function fetchAndApplyGrid(lat: number, lng: number) {
       if (fetchInFlight || !alive) return
       fetchInFlight = true
+      setFetching(true)
       gridCenterLat = lat
       gridCenterLng = lng
 
@@ -247,7 +260,7 @@ export default function GeoVisuals() {
 
       try {
         const url =
-          `https://api.open-meteo.com/v1/elevation` +
+          `/api/elevation` +
           `?latitude=${lats.join(',')}&longitude=${lngs.join(',')}`
         const res = await fetch(url)
         if (!res.ok || !alive) { fetchInFlight = false; return }
@@ -267,7 +280,10 @@ export default function GeoVisuals() {
         geometry.computeVertexNormals()
       } catch { /* keep current geometry on network failure */ }
       fetchInFlight = false
+      setFetching(false)
     }
+
+    fetchRef.current = (lat, lng) => void fetchAndApplyGrid(lat, lng)
 
     // ── Geo state subscription ────────────────────────────────────────────
     const unsub = geoState.subscribe((state) => {
@@ -278,6 +294,11 @@ export default function GeoVisuals() {
       uniforms.u_humidity.value    = state.humidity
 
       if (state.lat === 0 && state.lng === 0) return
+
+      // Keep debug inputs in sync with real GPS position
+      setDebugLat(prev => prev === '' ? state.lat.toFixed(5) : prev)
+      setDebugLng(prev => prev === '' ? state.lng.toFixed(5) : prev)
+
       const needsGrid =
         gridCenterLat === null ||
         haversineM(gridCenterLat, gridCenterLng!, state.lat, state.lng) > REFETCH_M
@@ -314,5 +335,86 @@ export default function GeoVisuals() {
     }
   }, [])
 
-  return <div ref={mountRef} style={{ position: 'fixed', inset: 0, zIndex: 0 }} />
+  const inputStyle: React.CSSProperties = {
+    background: 'rgba(255,255,255,0.06)',
+    border: '1px solid rgba(255,255,255,0.15)',
+    borderRadius: 4,
+    color: '#f1f5f9',
+    fontFamily: 'monospace',
+    fontSize: 12,
+    padding: '4px 8px',
+    width: '100%',
+    outline: 'none',
+  }
+
+  return (
+    <>
+      <div ref={mountRef} style={{ position: 'fixed', inset: 0, zIndex: 0 }} />
+
+      <div style={{
+        position: 'fixed', bottom: 80, right: 16, zIndex: 100,
+        background: 'rgba(0,0,0,0.75)',
+        backdropFilter: 'blur(6px)',
+        border: '1px solid rgba(255,255,255,0.1)',
+        borderRadius: 8,
+        padding: '12px 14px',
+        color: '#e2e8f0',
+        fontFamily: 'monospace',
+        fontSize: 11,
+        display: 'flex',
+        flexDirection: 'column',
+        gap: 8,
+        minWidth: 210,
+      }}>
+        <div style={{ color: '#7dd3fc', fontWeight: 'bold', letterSpacing: '0.1em' }}>
+          LOCATION
+        </div>
+
+        <label style={{ display: 'flex', flexDirection: 'column', gap: 3 }}>
+          <span style={{ color: '#94a3b8' }}>latitude</span>
+          <input
+            type="number"
+            step="0.001"
+            value={debugLat}
+            onChange={e => setDebugLat(e.target.value)}
+            onKeyDown={e => e.key === 'Enter' && handleDebugFetch()}
+            placeholder="e.g. 45.50884"
+            style={inputStyle}
+          />
+        </label>
+
+        <label style={{ display: 'flex', flexDirection: 'column', gap: 3 }}>
+          <span style={{ color: '#94a3b8' }}>longitude</span>
+          <input
+            type="number"
+            step="0.001"
+            value={debugLng}
+            onChange={e => setDebugLng(e.target.value)}
+            onKeyDown={e => e.key === 'Enter' && handleDebugFetch()}
+            placeholder="e.g. -73.58781"
+            style={inputStyle}
+          />
+        </label>
+
+        <button
+          onClick={handleDebugFetch}
+          disabled={fetching}
+          style={{
+            marginTop: 2,
+            background: fetching ? 'rgba(125,211,252,0.1)' : 'rgba(125,211,252,0.18)',
+            border: '1px solid rgba(125,211,252,0.3)',
+            borderRadius: 4,
+            color: fetching ? '#64748b' : '#7dd3fc',
+            fontFamily: 'monospace',
+            fontSize: 11,
+            padding: '5px 0',
+            cursor: fetching ? 'default' : 'pointer',
+            letterSpacing: '0.08em',
+          }}
+        >
+          {fetching ? 'fetching…' : 'fetch terrain ↵'}
+        </button>
+      </div>
+    </>
+  )
 }

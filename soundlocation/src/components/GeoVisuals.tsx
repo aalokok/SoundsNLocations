@@ -4,11 +4,17 @@ import { geoState } from '../geo/geoState'
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
-const GRID_SIZE  = 30          // 30×30 = 900 elevation samples
-const GRID_SPAN  = 0.10        // ±0.10° around centre (≈ ±11 km at mid-latitudes)
-const V_SCALE    = 1.2         // scene units — peaks sit 1.2 units above valleys
-const REFETCH_M  = 5000        // only re-fetch after moving 5 km
-const COOLDOWN_S = 90          // minimum seconds between any two fetch attempts
+const GRID_SIZE  = 20          // 20×20 = 400 elevation samples
+const GRID_SPAN  = 0.05          // ±0.05° (~±5.5 km at mid-latitudes)
+const V_SCALE    = 1.2
+const REFETCH_M  = 500           // re-fetch only after moving 500 m
+const BATCH_SIZE = 50            // 8 batches for 400 points (50×8)
+const BATCH_DELAY_MS = 5_000     // 5 s between batch requests
+
+// Module-level guards — survive React StrictMode remount
+let _fetchInFlight = false
+let _gridCenterLat: number | null = null
+let _gridCenterLng: number | null = null
 
 function haversineM(lat1: number, lng1: number, lat2: number, lng2: number): number {
   const R = 6_371_000
@@ -214,7 +220,7 @@ export default function GeoVisuals() {
     renderer.setSize(window.innerWidth, window.innerHeight)
     mount.appendChild(renderer.domElement)
 
-    // ── Geometry: 29×29 segments → 30×30 vertices ─────────────────────────
+    // ── Geometry: 19×19 segments → 20×20 vertices ───────────────────────────
     const SEGS     = GRID_SIZE - 1
     const geometry = new THREE.PlaneGeometry(5, 5, SEGS, SEGS)
 
@@ -237,28 +243,28 @@ export default function GeoVisuals() {
     const mesh = new THREE.Mesh(geometry, material)
     scene.add(mesh)
 
-    // ── Elevation grid fetch ──────────────────────────────────────────────
-    const TOTAL    = GRID_SIZE * GRID_SIZE
-    const targetZ  = new Float32Array(TOTAL)   // desired heights; lerped toward in tick
-    const LERP_SPD = 0.028                     // per-frame factor — ~1.5 s to settle
+    // ── Per-vertex animation + elevation fetch ────────────────────────────
+    const TOTAL       = GRID_SIZE * GRID_SIZE
+    const ANIM_DUR    = 2.2
+    const MAX_STAGGER = 0.6
+
+    const targetZ   = new Float32Array(TOTAL)
+    const fromZ     = new Float32Array(TOTAL)
+    const animStart = new Float32Array(TOTAL)
+    const stagger   = Float32Array.from({ length: TOTAL }, () => Math.random() * MAX_STAGGER)
     const positions = geometry.attributes.position as THREE.BufferAttribute
 
-    let gridCenterLat: number | null = null
-    let gridCenterLng: number | null = null
-    let fetchInFlight = false
-    let lastFetchEnd   = 0
+    function easeOutCubic(t: number) { return 1 - (1 - t) ** 3 }
+
+    const clock = new THREE.Clock()
 
     async function fetchAndApplyGrid(lat: number, lng: number) {
-      const now = Date.now()
-      if (fetchInFlight || !alive) return
-      if (now - lastFetchEnd < COOLDOWN_S * 1000) return
-      fetchInFlight = true
+      if (_fetchInFlight || !alive) return
+      _fetchInFlight   = true
+      _gridCenterLat   = lat
+      _gridCenterLng   = lng
       setFetching(true)
-      gridCenterLat = lat
-      gridCenterLng = lng
 
-      // Vertex order matches PlaneGeometry:
-      //   row=0 → top (+Y, northernmost lat)  col=0 → left (-X, westernmost lng)
       const lats: string[] = []
       const lngs: string[] = []
       for (let row = 0; row < GRID_SIZE; row++) {
@@ -269,61 +275,62 @@ export default function GeoVisuals() {
       }
 
       try {
-        // One chunk every 13 s → full 30×30 grid builds over ~2 minutes.
-        // Each chunk is applied immediately so the terrain grows in real-time.
-        const CHUNK      = 100
-        const CHUNK_DELAY = 13_000 // ms
-        const total       = lats.length
-        const allElevs    = new Array<number>(total).fill(0)
-        const loaded      = new Array<boolean>(total).fill(false)
-        let   gMin        = Infinity
-        let   gMax        = -Infinity
+        const total    = lats.length
+        const allElevs = new Array<number>(total).fill(0)
+        const loaded   = new Array<boolean>(total).fill(false)
+        let gMin = Infinity
+        let gMax = -Infinity
 
         function applyLoaded() {
-          // Write into targetZ — the tick loop will lerp positions toward these
           const range = Math.max(gMax - gMin, 1)
+          const now   = clock.getElapsedTime()
           for (let k = 0; k < total; k++) {
-            if (loaded[k]) {
-              targetZ[k] = ((allElevs[k] - gMin) / range) * V_SCALE
+            if (!loaded[k]) continue
+            const newTarget = ((allElevs[k] - gMin) / range) * V_SCALE
+            if (Math.abs(newTarget - targetZ[k]) > 0.001) {
+              fromZ[k]     = positions.getZ(k)
+              animStart[k] = now + stagger[k]
+              targetZ[k]   = newTarget
             }
           }
         }
 
-        for (let i = 0; i < total; i += CHUNK) {
-          if (!alive) { fetchInFlight = false; return }
+        for (let i = 0; i < total; i += BATCH_SIZE) {
+          if (!alive) { _fetchInFlight = false; return }
 
-          const bLats = lats.slice(i, i + CHUNK).join(',')
-          const bLngs = lngs.slice(i, i + CHUNK).join(',')
+          const bLats = lats.slice(i, i + BATCH_SIZE).join(',')
+          const bLngs = lngs.slice(i, i + BATCH_SIZE).join(',')
           try {
             const r = await fetch(`/api/elevation?latitude=${bLats}&longitude=${bLngs}`)
             if (r.ok) {
               const d = (await r.json()) as { elevation: number[] }
               d.elevation.forEach((e, j) => {
-                allElevs[i + j] = e
-                loaded[i + j]   = true
+                const idx = i + j
+                allElevs[idx] = e
+                loaded[idx]   = true
                 if (e < gMin) gMin = e
                 if (e > gMax) gMax = e
               })
-              applyLoaded()  // update mesh immediately with what we have so far
+              applyLoaded()
             }
-          } catch { /* skip chunk */ }
+          } catch { /* skip batch */ }
 
-          if (i + CHUNK < total) {
-            await new Promise<void>(resolve => setTimeout(resolve, CHUNK_DELAY))
+          if (i + BATCH_SIZE < total) {
+            await new Promise<void>(resolve => setTimeout(resolve, BATCH_DELAY_MS))
           }
         }
-      } catch { /* keep current geometry on network failure */ }
-      fetchInFlight = false
-      lastFetchEnd  = Date.now()
+      } catch { /* keep current geometry */ }
+      _fetchInFlight = false
       setFetching(false)
     }
 
     fetchRef.current = (lat, lng) => {
-      lastFetchEnd = 0 // bypass cooldown for manual debug fetches
+      _gridCenterLat = null // force re-fetch for manual debug
       void fetchAndApplyGrid(lat, lng)
     }
 
-    // ── Geo state subscription ────────────────────────────────────────────
+    let isInitialSnapshot = true
+
     const unsub = geoState.subscribe((state) => {
       uniforms.u_temperature.value = state.temperature
       uniforms.u_altitude.value    = state.altitude
@@ -331,15 +338,24 @@ export default function GeoVisuals() {
       uniforms.u_cloudCover.value  = state.cloudCover
       uniforms.u_humidity.value    = state.humidity
 
+      if (isInitialSnapshot) {
+        isInitialSnapshot = false
+        if (state.lat !== 0 || state.lng !== 0) {
+          setDebugLat(prev => prev === '' ? state.lat.toFixed(5) : prev)
+          setDebugLng(prev => prev === '' ? state.lng.toFixed(5) : prev)
+          if (_gridCenterLat === null && !_fetchInFlight) void fetchAndApplyGrid(state.lat, state.lng)
+        }
+        return
+      }
+
       if (state.lat === 0 && state.lng === 0) return
 
-      // Keep debug inputs in sync with real GPS position
       setDebugLat(prev => prev === '' ? state.lat.toFixed(5) : prev)
       setDebugLng(prev => prev === '' ? state.lng.toFixed(5) : prev)
 
       const needsGrid =
-        gridCenterLat === null ||
-        haversineM(gridCenterLat, gridCenterLng!, state.lat, state.lng) > REFETCH_M
+        _gridCenterLat === null ||
+        haversineM(_gridCenterLat, _gridCenterLng!, state.lat, state.lng) > REFETCH_M
       if (needsGrid) void fetchAndApplyGrid(state.lat, state.lng)
     })
 
@@ -353,9 +369,7 @@ export default function GeoVisuals() {
 
     // ── Animation loop ────────────────────────────────────────────────────
     let rafId: number
-    const clock = new THREE.Clock()
-    const ROTATION_PERIOD = 120  // seconds per full Z revolution
-    const SNAP_THRESHOLD  = 5e-4 // stop lerping below this distance
+    const ROTATION_PERIOD = 120
 
     const tick = () => {
       rafId = requestAnimationFrame(tick)
@@ -363,19 +377,16 @@ export default function GeoVisuals() {
       uniforms.u_time.value = t
       mesh.rotation.z = (t / ROTATION_PERIOD) * Math.PI * 2
 
-      // Lerp each vertex toward its target height
       let dirty = false
       for (let i = 0; i < TOTAL; i++) {
-        const cur = positions.getZ(i)
         const tgt = targetZ[i]
-        const diff = tgt - cur
-        if (Math.abs(diff) > SNAP_THRESHOLD) {
-          positions.setZ(i, cur + diff * LERP_SPD)
-          dirty = true
-        } else if (cur !== tgt) {
-          positions.setZ(i, tgt)
-          dirty = true
-        }
+        const cur = positions.getZ(i)
+        if (cur === tgt) continue
+        const elapsed = t - animStart[i]
+        if (elapsed <= 0) continue
+        const progress = Math.min(elapsed / ANIM_DUR, 1.0)
+        positions.setZ(i, fromZ[i] + (tgt - fromZ[i]) * easeOutCubic(progress))
+        dirty = true
       }
       if (dirty) {
         positions.needsUpdate = true
